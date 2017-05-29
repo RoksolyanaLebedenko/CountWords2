@@ -13,10 +13,6 @@
 
 using namespace std;
 
-deque<vector<string>> allwords;
-condition_variable condV;
-atomic <bool> res = {false};
-mutex mutex1;
 
 //realization of clock
 inline chrono::high_resolution_clock::time_point get_current_time_fenced()
@@ -42,14 +38,14 @@ struct less_second {
     }
 };
 
-void producer(const string& file) {
+void producer(ifstream& myfile, int& block_size,mutex& mutex1,
+              deque<vector<string>>& allwords,condition_variable& condV,
+              atomic<bool>& res) {
+
     string line;
-    int block_size = 30;
-    cout << "Enter size of block:";
-    cin >> block_size;
-    map<string, int> myMap;
+
     auto open_start_time = get_current_time_fenced();
-    ifstream myfile(file);
+
 
     vector<string> block = {};
 
@@ -73,7 +69,7 @@ void producer(const string& file) {
     }
 
     else{
-        cout << "Unable to open file" << file << endl;
+        cout << "Unable to open file with words" << endl;
         return;
     }
     if (block.size() != 0){
@@ -90,7 +86,8 @@ void producer(const string& file) {
     return;
 
 }
-void consumer(map<string, int>& myMap){
+void consumer(deque<map<string,int>>& que_join,mutex& mutex1,mutex& mutex2,deque<vector<string>>& allwords,
+              condition_variable& condV,atomic<bool>& res,condition_variable& condV_join,atomic<bool>& res_join){
     while(true){
         unique_lock<mutex> lock1(mutex1);
         if (!allwords.empty()) {
@@ -100,19 +97,82 @@ void consumer(map<string, int>& myMap){
             string word;
             for(int i = 0; i < vector1.size(); i++) {
                 istringstream iss(vector1[i]);
+                map<string,int> w;
                 while(iss >> word){
-                    unique_lock<mutex> lock2(mutex1);
-                    ++myMap[word];
+                    lock_guard<mutex> lock2(mutex2);
+                    ++w[word];
                 }
+                que_join.push_back(w);
+                if(que_join.size()>1){
+                    condV_join.notify_one();
+                }
+
             }
         }
         else {
-            if(res)
-                break;
-            else
-                condV.wait(lock1);
+            if(res){
+                res_join = true;
+                condV_join.notify_all();
+                break;}
+            else{
+                condV.wait(lock1);}
         }
     }
+}
+
+void joinWords(deque<map<string,int>>& que_join,mutex& mutex2,
+               condition_variable& condV_join,atomic<bool>& res_join){
+    while(true){
+        unique_lock<mutex> lock2(mutex2);
+        if(que_join.size() > 1){
+            map<string,int> first = que_join.front();
+            que_join.pop_front();
+            map<string,int> second= que_join.front();
+            que_join.pop_front();
+            lock2.unlock();
+            for(const auto& i:first){
+                second[i.first] += i.second;
+            }
+
+            unique_lock<mutex> lock2(mutex2);
+            que_join.push_back(second);
+            lock2.unlock();
+
+        }
+        else{
+            if(res_join){
+                break;
+            }
+            else {
+                condV_join.wait(lock2);}
+        }
+    }
+
+}
+
+map<string, string> configm(string filename) {
+    string line;
+    ifstream myfile;
+    map<string, string> cmap;
+    myfile.open(filename);
+
+    if (myfile.is_open())
+    {
+        while (getline(myfile,line))
+        {
+            int pos = line.find("=");
+            string key = line.substr(0, pos);
+            string value = line.substr(pos + 1);
+            cmap[key] = value;
+        }
+
+        myfile.close();
+    }
+    else {
+        cout << "Error with opening the file!" << endl;
+    }
+    return cmap;
+
 }
 
 int main()
@@ -120,32 +180,61 @@ int main()
 
     map<string, int> myMap;
     string file;
-    cout << "Please enter a path to file with words: ";
-    cin >> file;
-    //file = "/home/roksoliana/file.txt";
-    auto total_start_time = get_current_time_fenced();
-    thread threads[2];
-    threads[0] = thread(producer, file);
-    threads[1] = thread(consumer, ref(myMap));
+      cout << "Please enter a path to configuration file: ";
+      cin >> file;
+    //file = "/home/roksoliana/config.txt";
+    map<string, string> cmap = configm(file);
+    string filewithwords = cmap["filewithwords"];
+    string writeByWords = cmap["writeByWords"];
+    string writeByNumber = cmap["writeByNumber"];
+    int numOfthreads = stoi(cmap["numOfthreads"]);
+    int block_size = stoi(cmap["blocksize"]);
 
-    for(int i = 0; i < 2; i++){
-        threads[i].join();
+    mutex mutex1;
+    mutex mutex2;
+    deque<vector<string>> allwords;
+    deque<map<string,int>> que_join;
+    condition_variable condV;
+    atomic <bool> res = {false};
+    condition_variable condV_join;
+    atomic <bool> res_join = {false};
+
+    ifstream myfile(filewithwords);
+
+    auto total_start_time = get_current_time_fenced();
+    thread cons_threads[numOfthreads];
+    thread join_threads[numOfthreads];
+    thread prod_thread = thread(producer, ref(myfile), ref(block_size),ref(mutex1),ref(allwords),ref(condV),ref(res));
+
+    for(int i = 0; i < numOfthreads;i++){
+        cons_threads[i] = thread(consumer, ref(que_join),ref(mutex1),ref(mutex2),ref(allwords),ref(condV),
+                                 ref(res),ref(condV_join),ref(res_join));
     }
+    for(int i = 0; i < numOfthreads;i++){
+        join_threads[i] = thread(joinWords, ref(que_join),ref(mutex2),ref(condV_join),ref(res_join));
+    }
+
+
+    prod_thread.join();
+    for(int i = 0; i < numOfthreads;i++){
+        cons_threads[i].join();
+    }
+    for(int i = 0; i < numOfthreads;i++){
+        join_threads[i].join();
+    }
+    myMap = que_join.front();
+
     //------------Write to file by word------------------
-    string wrFile1;
-    cout << "Please enter a path to file, where words will be sorted alphabetically: ";
-    cin >> wrFile1;
-    //wrFile1 = "/home/roksoliana/fileout_by_word.txt";
     ofstream outmyfile;
-    outmyfile.open(wrFile1);
+    outmyfile.open(writeByWords);
     if (outmyfile.is_open()){
-        for (auto it = myMap.begin(); it != myMap.end(); ++it)
-        {
-            outmyfile << (*it).first << " : " << (*it).second << "\n";
-        }
-        outmyfile.close();}
+    for (auto it = myMap.begin(); it != myMap.end(); ++it)
+    {
+      outmyfile << (*it).first << " : " << (*it).second << "\n";
+    }
+      outmyfile.close();}
     else{
-        cout << "Enable to open a file" << wrFile1 << endl;
+        cout << "Enable to open a file" << writeByWords << endl;
         return 0;
     }
 
@@ -155,12 +244,8 @@ int main()
 
     vector<pair<string, int> > mapcopy(myMap.begin(), myMap.end());
     sort(mapcopy.begin(), mapcopy.end(), less_second<string, int>());
-    string wrFile2;
-    cout << "Please enter a path to file, where words will be sorted by number of each word: ";
-    cin >> wrFile2;
-    //wrFile2 = "/home/roksoliana/fileout_by_number.txt";
     ofstream outmyfile2;
-    outmyfile2.open (wrFile2);
+    outmyfile2.open (writeByNumber);
     if (outmyfile2.is_open()){
         for (auto it = mapcopy.begin(); it != mapcopy.end(); ++it)
         {
@@ -171,7 +256,7 @@ int main()
         cout << "Total time: "<< to_us(total_end_time-total_start_time) / (double)(1000) << " ms\n" << endl;
     }
     else{
-        cout << "Enable to open a file" << wrFile2 << endl;
+        cout << "Enable to open a file" << writeByNumber << endl;
         return 0;
     }
     return 0;
